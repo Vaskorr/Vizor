@@ -1,0 +1,21 @@
+services:
+  vizor:
+    build: .
+    container_name: vizor
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - vizor-data:/data
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      TZ: Europe/Moscow
+      VIZOR_CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+    stop_grace_period: 20s
+
+volumes:
+  vizor-data:

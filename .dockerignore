@@ -1,0 +1,8 @@
+node_modules
+.git
+.wrangler
+.next
+dist
+*.log
+__pycache__
+*.pyc
