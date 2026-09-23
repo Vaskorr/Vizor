@@ -20,6 +20,8 @@ Open:
 - Web interface: <http://localhost:3000>
 - API documentation: <http://localhost:8000/docs>
 
+The initial credentials are `vizor` / `vizor`. Change `VIZOR_PASSWORD` in `docker-compose.yml` before exposing the service, then recreate the container with `docker compose up --build -d`.
+
 On first launch, open **Settings**, add the network segments you are authorized to scan, review the Nmap flags and NSE scripts, configure the schedule, and save the configuration.
 
 Application data is stored in the `vizor-data` Docker volume. The container is granted `NET_RAW` and `NET_ADMIN` capabilities for Nmap and exposes both services on localhost only.
@@ -40,6 +42,8 @@ docker compose up --build -d
 ```
 
 ## Security
+
+The API requires authentication and stores the session in an HttpOnly, SameSite cookie. Credentials are read from `VIZOR_USERNAME` and `VIZOR_PASSWORD`; authentication failures intentionally return the same generic error.
 
 Vizor never invokes Nmap through a shell. Additional Nmap arguments are parsed into an argument array and validated against the Nmap 7.x scan-option grammar, including options with separate, attached, or `--option=value` parameters. Unknown options and positional arguments are rejected. Vizor exclusively manages scan targets and output files; input-file, data-directory, resume, arbitrary output, and NSE script-path options are blocked. Scan targets and exclusions must be IP addresses or CIDR networks, and NSE selectors accept only installed script/category names or selector expressions.
 

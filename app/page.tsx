@@ -15,6 +15,9 @@ import {
   FileSearch,
   Gauge,
   History,
+  LockKeyhole,
+  LogIn,
+  LogOut,
   Menu,
   Network,
   Play,
@@ -64,6 +67,16 @@ type HealthData = { status: string; nmap: string; database_bytes: number; scan_f
 function apiUrl(path: string) {
   if (typeof window === "undefined") return `http://localhost:8000${path}`;
   return `${window.location.protocol}//${window.location.hostname}:8000${path}`;
+}
+
+const authExpiredEvent = "vizor-auth-expired";
+
+async function apiFetch(path: string, init?: RequestInit) {
+  const response = await fetch(apiUrl(path), { ...init, credentials: "include" });
+  if (response.status === 401 && !path.startsWith("/api/auth/") && typeof window !== "undefined") {
+    window.dispatchEvent(new Event(authExpiredEvent));
+  }
+  return response;
 }
 
 function formatDuration(seconds?: number) {
@@ -116,6 +129,53 @@ function IconButton({ label, children, onClick, className = "" }: { label: strin
 
 function Panel({ title, meta, action, children, className = "" }: { title: string; meta?: string; action?: ReactNode; children: ReactNode; className?: string }) {
   return <section className={`panel ${className}`}><div className="panel-header"><div><h2>{title}</h2>{meta && <p>{meta}</p>}</div>{action}</div>{children}</section>;
+}
+
+function LoginView({ checking = false, onAuthenticated }: { checking?: boolean; onAuthenticated?: () => void }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (submitting) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const response = await apiFetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      if (!response.ok) {
+        setError("Неверный логин или пароль");
+        return;
+      }
+      onAuthenticated?.();
+    } catch {
+      setError("Сервис Vizor недоступен");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return <div className="auth-shell">
+    <main className="auth-panel">
+      <div className="auth-brand"><span className="brand-mark"><ShieldCheck size={22} /></span><span><strong>VIZOR</strong><small>NETWORK MONITOR</small></span></div>
+      {checking ? <div className="auth-loading" aria-live="polite"><RefreshCw size={19} className="spinning" /><strong>Проверяем сессию</strong></div> : <>
+        <div className="auth-heading"><span><LockKeyhole size={17} /></span><div><h1>Вход в Vizor</h1><p>Укажите учётные данные оператора</p></div></div>
+        <form className="auth-form" onSubmit={submit}>
+          <label htmlFor="username">Логин</label>
+          <input id="username" name="username" autoComplete="username" autoFocus value={username} onChange={event => { setUsername(event.target.value); setError(""); }} />
+          <label htmlFor="password">Пароль</label>
+          <input id="password" name="password" type="password" autoComplete="current-password" value={password} onChange={event => { setPassword(event.target.value); setError(""); }} />
+          {error && <div className="auth-error" role="alert"><AlertTriangle size={14} />{error}</div>}
+          <button className="primary-button auth-submit" type="submit" disabled={submitting || !username || !password}>{submitting ? <RefreshCw size={16} className="spinning" /> : <LogIn size={16} />}{submitting ? "Входим…" : "Войти"}</button>
+        </form>
+      </>}
+    </main>
+  </div>;
 }
 
 function Dashboard({ onNavigate, onRunScan, data, health, recentScans, segments }: { onNavigate: (view: View) => void; onRunScan: () => void; data: DashboardData | null; health: HealthData | null; recentScans: Scan[]; segments: Segment[] }) {
@@ -206,7 +266,7 @@ function ChangesView({ segmentId, setSegmentId, segments }: { segmentId: string;
 
   useEffect(() => {
     if (!segmentId) return;
-    fetch(apiUrl(`/api/scans?segment_id=${encodeURIComponent(segmentId)}`)).then(response => response.ok ? response.json() : Promise.reject()).then((items: Array<Record<string, unknown>>) => {
+    apiFetch(`/api/scans?segment_id=${encodeURIComponent(segmentId)}`).then(response => response.ok ? response.json() : Promise.reject()).then((items: Array<Record<string, unknown>>) => {
       if (!items.length) { setAvailableScans([]); setFromScan(""); setToScan(""); setChangeData([]); return; }
       const mapped: Scan[] = items.map(item => ({ id: String(item.id), segmentId: String(item.segment_id), label: new Date(String(item.started_at)).toLocaleString("ru-RU", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }), started: new Date(String(item.started_at)).toLocaleString("ru-RU"), startedAt: String(item.started_at), duration: formatDuration(Number(item.duration_seconds)), hosts: Number(item.hosts), ports: Number(item.ports), status: item.status as Scan["status"] }));
       setAvailableScans(current => [...current.filter(scan => scan.segmentId !== segmentId), ...mapped]);
@@ -216,7 +276,7 @@ function ChangesView({ segmentId, setSegmentId, segments }: { segmentId: string;
 
   useEffect(() => {
     if (!fromScan || !toScan) return;
-    fetch(apiUrl(`/api/changes?segment_id=${encodeURIComponent(segmentId)}&older=${encodeURIComponent(fromScan)}&newer=${encodeURIComponent(toScan)}`)).then(response => response.ok ? response.json() : Promise.reject()).then((payload: { hosts: HostChange[] }) => setChangeData(payload.hosts)).catch(() => undefined);
+    apiFetch(`/api/changes?segment_id=${encodeURIComponent(segmentId)}&older=${encodeURIComponent(fromScan)}&newer=${encodeURIComponent(toScan)}`).then(response => response.ok ? response.json() : Promise.reject()).then((payload: { hosts: HostChange[] }) => setChangeData(payload.hosts)).catch(() => undefined);
   }, [segmentId, fromScan, toScan]);
 
   function updateSegment(value: string) {
@@ -230,7 +290,7 @@ function ChangesView({ segmentId, setSegmentId, segments }: { segmentId: string;
   async function exportPdf() {
     if (!fromScan || !toScan) { window.print(); return; }
     try {
-      const response = await fetch(apiUrl(`/api/reports/changes.pdf?segment_id=${encodeURIComponent(segmentId)}&older=${encodeURIComponent(fromScan)}&newer=${encodeURIComponent(toScan)}`));
+      const response = await apiFetch(`/api/reports/changes.pdf?segment_id=${encodeURIComponent(segmentId)}&older=${encodeURIComponent(fromScan)}&newer=${encodeURIComponent(toScan)}`);
       if (!response.ok) throw new Error();
       const href = URL.createObjectURL(await response.blob());
       const link = document.createElement("a"); link.href = href; link.download = `vizor-${segmentId}-changes.pdf`; link.click(); URL.revokeObjectURL(href);
@@ -347,7 +407,7 @@ function SettingsView({ segments, setSegments, settings, onSaved, showToast }: {
   async function save() {
     setSaving(true);
     try {
-      const response = await fetch(apiUrl("/api/settings"), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const response = await apiFetch("/api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || "Сервер отклонил настройки");
       setValidation("valid");
@@ -360,7 +420,7 @@ function SettingsView({ segments, setSegments, settings, onSaved, showToast }: {
   }
   async function validate() {
     try {
-      const response = await fetch(apiUrl("/api/settings/validate"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const response = await apiFetch("/api/settings/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.detail || "Конфигурация некорректна");
       setValidation("valid"); showToast("Конфигурация Nmap корректна");
@@ -392,6 +452,7 @@ function SettingsView({ segments, setSegments, settings, onSaved, showToast }: {
 }
 
 export default function VizorApp() {
+  const [authState, setAuthState] = useState<"checking" | "authenticated" | "anonymous">("checking");
   const [view, setView] = useState<View>("dashboard");
   const [mobileNav, setMobileNav] = useState(false);
   const [segmentId, setSegmentId] = useState("");
@@ -408,14 +469,23 @@ export default function VizorApp() {
   const [scanning, setScanning] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const meta = pageMeta[view];
+  useEffect(() => {
+    let active = true;
+    apiFetch("/api/auth/session").then(response => {
+      if (active) setAuthState(response.ok ? "authenticated" : "anonymous");
+    }).catch(() => { if (active) setAuthState("anonymous"); });
+    const expire = () => setAuthState("anonymous");
+    window.addEventListener(authExpiredEvent, expire);
+    return () => { active = false; window.removeEventListener(authExpiredEvent, expire); };
+  }, []);
   const loadBackend = useCallback(async () => {
     try {
       const [segmentResponse, dashboardResponse, searchResponse, scansResponse, healthResponse] = await Promise.all([
-        fetch(apiUrl("/api/segments")),
-        fetch(apiUrl("/api/dashboard")),
-        fetch(apiUrl("/api/search?limit=5000")),
-        fetch(apiUrl("/api/scans?limit=20")),
-        fetch(apiUrl("/api/health")),
+        apiFetch("/api/segments"),
+        apiFetch("/api/dashboard"),
+        apiFetch("/api/search?limit=5000"),
+        apiFetch("/api/scans?limit=20"),
+        apiFetch("/api/health"),
       ]);
       if (!segmentResponse.ok || !dashboardResponse.ok || !searchResponse.ok || !scansResponse.ok || !healthResponse.ok) throw new Error("API unavailable");
       const [segmentItems, dashboardItem, searchItems, scanItems, healthItem] = await Promise.all([segmentResponse.json(), dashboardResponse.json(), searchResponse.json(), scansResponse.json(), healthResponse.json()]);
@@ -433,22 +503,31 @@ export default function VizorApp() {
     }
   }, []);
   useEffect(() => {
+    if (authState !== "authenticated") return;
     const timer = window.setTimeout(() => { loadBackend(); }, 0);
     return () => window.clearTimeout(timer);
-  }, [loadBackend]);
+  }, [authState, loadBackend]);
   function showToast(message: string) { setToast(message); window.setTimeout(() => setToast(""), 2800); }
   async function runScan() {
     if (scanning || !segmentId) { if (!segmentId) showToast("Сначала добавьте активный сегмент в настройках"); return; }
     setScanning(true); showToast("Сканирование поставлено в очередь");
     try {
-      const response = await fetch(apiUrl("/api/scans/run"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ segment_id: segmentId }) });
+      const response = await apiFetch("/api/scans/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ segment_id: segmentId }) });
       if (!response.ok) { const payload = await response.json().catch(() => ({})); showToast(payload.detail || "Не удалось запустить скан"); }
       else { showToast("Nmap запущен в фоне"); await loadBackend(); }
     } catch { showToast("API Vizor недоступен — скан не запущен"); setApiError(true); }
     window.setTimeout(() => setScanning(false), 1800);
   }
   async function refresh() { setRefreshing(true); await loadBackend(); window.setTimeout(() => { setRefreshing(false); showToast("Данные обновлены"); }, 500); }
+  async function logout() {
+    try { await apiFetch("/api/auth/logout", { method: "POST" }); } finally {
+      setAuthState("anonymous");
+      setDashboardData(null); setHealth(null); setSettingsData(null); setSegments([]); setInventoryRows([]); setRecentScans([]);
+    }
+  }
   function navigate(next: View) { setView(next); setMobileNav(false); window.scrollTo({ top: 0, behavior: "smooth" }); }
+  if (authState === "checking") return <LoginView checking />;
+  if (authState === "anonymous") return <LoginView onAuthenticated={() => setAuthState("authenticated")} />;
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav ? "open" : ""}`}>
       <div className="brand"><span className="brand-mark"><ShieldCheck size={21} /></span><span><strong>VIZOR</strong><small>NETWORK MONITOR</small></span></div>
@@ -457,7 +536,7 @@ export default function VizorApp() {
     </aside>
     {mobileNav && <button className="sidebar-backdrop" aria-label="Закрыть меню" onClick={() => setMobileNav(false)} />}
     <main className="main-area">
-      <header className="topbar"><div className="title-group"><IconButton label="Открыть меню" className="menu-button" onClick={() => setMobileNav(true)}><Menu size={19} /></IconButton><div><div className="breadcrumb"><span>Vizor</span><ChevronRight size={12} /><span>{meta.title}</span></div><h1>{meta.title}</h1><p>{meta.subtitle}</p></div></div><div className="top-actions"><div className="sync-time"><span className={apiError ? "offline-dot" : "online-dot"} /><span><strong>{apiError ? "Сервис недоступен" : "Сервис доступен"}</strong><small>{lastSync ? `Синхронизация ${lastSync}` : "Подключение…"}</small></span></div><IconButton label="Обновить данные" onClick={refresh}><RefreshCw size={17} className={refreshing ? "spinning" : ""} /></IconButton><button className="primary-button" onClick={runScan} disabled={scanning || !segmentId || apiError}>{scanning ? <RefreshCw size={16} className="spinning" /> : <Play size={16} fill="currentColor" />}{scanning ? "Запускаем…" : "Запустить скан"}</button></div></header>
+      <header className="topbar"><div className="title-group"><IconButton label="Открыть меню" className="menu-button" onClick={() => setMobileNav(true)}><Menu size={19} /></IconButton><div><div className="breadcrumb"><span>Vizor</span><ChevronRight size={12} /><span>{meta.title}</span></div><h1>{meta.title}</h1><p>{meta.subtitle}</p></div></div><div className="top-actions"><div className="sync-time"><span className={apiError ? "offline-dot" : "online-dot"} /><span><strong>{apiError ? "Сервис недоступен" : "Сервис доступен"}</strong><small>{lastSync ? `Синхронизация ${lastSync}` : "Подключение…"}</small></span></div><IconButton label="Обновить данные" onClick={refresh}><RefreshCw size={17} className={refreshing ? "spinning" : ""} /></IconButton><IconButton label="Выйти" onClick={logout}><LogOut size={17} /></IconButton><button className="primary-button" onClick={runScan} disabled={scanning || !segmentId || apiError}>{scanning ? <RefreshCw size={16} className="spinning" /> : <Play size={16} fill="currentColor" />}{scanning ? "Запускаем…" : "Запустить скан"}</button></div></header>
       <div className="content-area">
         {apiError && <div className="offline-banner"><AlertTriangle size={17} /><div><strong>Нет соединения с API Vizor</strong><span>Данные не подменяются демонстрационными значениями. Проверьте контейнер и повторите подключение.</span></div><button className="secondary-button" onClick={refresh}>Повторить</button></div>}
         {view === "dashboard" && <Dashboard onNavigate={navigate} onRunScan={runScan} data={dashboardData} health={health} recentScans={recentScans} segments={segments} />}

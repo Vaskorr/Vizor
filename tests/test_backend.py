@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi.testclient import TestClient
+
 
 SAMPLE_XML = """<?xml version="1.0"?>
 <nmaprun scanner="nmap">
@@ -30,6 +32,9 @@ class VizorBackendTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         os.environ["VIZOR_DATA_DIR"] = self.temp_dir.name
+        os.environ["VIZOR_USERNAME"] = "vizor"
+        os.environ["VIZOR_PASSWORD"] = "vizor"
+        os.environ["VIZOR_COOKIE_SECURE"] = "false"
         import server.main
         self.main = importlib.reload(server.main)
         self.main.init_db()
@@ -46,6 +51,36 @@ class VizorBackendTest(unittest.TestCase):
         self.assertEqual(command[0:4], ["nmap", "-T3", "-sV", "--reason"])
         self.assertIn("10.20.0.0/24", command)
         self.assertNotIn("shell=True", command)
+
+    def test_authentication_protects_api_and_uses_generic_login_error(self):
+        with TestClient(self.main.app) as client:
+            self.assertEqual(client.get("/api/health").status_code, 200)
+            protected = client.get("/api/settings", headers={"Origin": "http://localhost:3000"})
+            self.assertEqual(protected.status_code, 401)
+            self.assertEqual(protected.headers["access-control-allow-origin"], "http://localhost:3000")
+            self.assertEqual(protected.headers["access-control-allow-credentials"], "true")
+            self.assertEqual(client.get("/docs").status_code, 401)
+
+            for username, password in (("wrong", "vizor"), ("vizor", "wrong"), ("", "")):
+                response = client.post("/api/auth/login", json={"username": username, "password": password})
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json(), {"detail": "Неверный логин или пароль"})
+
+            login = client.post(
+                "/api/auth/login",
+                json={"username": "vizor", "password": "vizor"},
+                headers={"Origin": "http://localhost:3000"},
+            )
+            self.assertEqual(login.status_code, 200)
+            self.assertEqual(login.headers["access-control-allow-origin"], "http://localhost:3000")
+            cookie = login.headers["set-cookie"]
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=strict", cookie)
+            self.assertEqual(client.get("/api/settings").status_code, 200)
+            self.assertEqual(client.get("/api/auth/session").status_code, 200)
+
+            self.assertEqual(client.post("/api/auth/logout").status_code, 200)
+            self.assertEqual(client.get("/api/settings").status_code, 401)
 
     def test_rejects_shell_and_argument_injection(self):
         base = {"speed": "T3", "flags": "-sV --reason", "scripts": "default,safe", "exclusions": ""}

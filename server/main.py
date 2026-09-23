@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hmac
 import io
 import ipaddress
 import json
 import os
 import re
+import secrets
 import shlex
 import sqlite3
 import subprocess
@@ -17,9 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -141,6 +143,44 @@ DEFAULT_SETTINGS = {
     "day": "monday",
     "time": "11:00",
 }
+AUTH_USERNAME = os.getenv("VIZOR_USERNAME", "vizor")
+AUTH_PASSWORD = os.getenv("VIZOR_PASSWORD", "vizor")
+AUTH_COOKIE_NAME = "vizor_session"
+AUTH_SESSION_SECONDS = max(300, int(os.getenv("VIZOR_SESSION_SECONDS", "43200")))
+AUTH_COOKIE_SECURE = os.getenv("VIZOR_COOKIE_SECURE", "false").lower() in {"1", "true", "yes"}
+AUTH_SESSIONS: dict[str, float] = {}
+AUTH_SESSIONS_LOCK = threading.Lock()
+AUTH_PUBLIC_PATHS = frozenset({"/api/health", "/api/auth/login", "/api/auth/logout"})
+
+
+def create_auth_session() -> str:
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with AUTH_SESSIONS_LOCK:
+        expired = [key for key, expires_at in AUTH_SESSIONS.items() if expires_at <= now]
+        for key in expired:
+            AUTH_SESSIONS.pop(key, None)
+        AUTH_SESSIONS[token] = now + AUTH_SESSION_SECONDS
+    return token
+
+
+def auth_session_is_valid(token: str | None) -> bool:
+    if not token:
+        return False
+    now = time.time()
+    with AUTH_SESSIONS_LOCK:
+        expires_at = AUTH_SESSIONS.get(token)
+        if expires_at is None or expires_at <= now:
+            AUTH_SESSIONS.pop(token, None)
+            return False
+    return True
+
+
+def revoke_auth_session(token: str | None) -> None:
+    if not token:
+        return
+    with AUTH_SESSIONS_LOCK:
+        AUTH_SESSIONS.pop(token, None)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -150,12 +190,34 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Vizor API", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_authentication(request: Request, call_next):
+    path = request.url.path.rstrip("/") or "/"
+    if request.method == "OPTIONS" or path in AUTH_PUBLIC_PATHS:
+        return await call_next(request)
+    if not auth_session_is_valid(request.cookies.get(AUTH_COOKIE_NAME)):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Требуется авторизация"},
+            headers={"Cache-Control": "no-store"},
+        )
+    return await call_next(request)
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.getenv("VIZOR_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if origin.strip()],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class LoginPayload(BaseModel):
+    username: str = ""
+    password: str = ""
 
 
 class ScanRequest(BaseModel):
@@ -549,6 +611,45 @@ def execute_scan(scan_id: str, segment_id: str) -> None:
     except Exception as exc:  # recorded for the operator; background job must not vanish
         with db() as conn:
             conn.execute("UPDATE scans SET status='failed', finished_at=?, duration_seconds=?, error=? WHERE id=?", (now_iso(), round(time.monotonic() - started, 2), str(exc), scan_id))
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginPayload, response: Response) -> dict[str, str]:
+    username_matches = hmac.compare_digest(payload.username.encode("utf-8"), AUTH_USERNAME.encode("utf-8"))
+    password_matches = hmac.compare_digest(payload.password.encode("utf-8"), AUTH_PASSWORD.encode("utf-8"))
+    if not (username_matches and password_matches):
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+    token = create_auth_session()
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=AUTH_SESSION_SECONDS,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"status": "authenticated", "username": AUTH_USERNAME}
+
+
+@app.get("/api/auth/session")
+def auth_session() -> dict[str, str]:
+    return {"status": "authenticated", "username": AUTH_USERNAME}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response) -> dict[str, str]:
+    revoke_auth_session(request.cookies.get(AUTH_COOKIE_NAME))
+    response.delete_cookie(
+        key=AUTH_COOKIE_NAME,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite="strict",
+        path="/",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return {"status": "logged_out"}
 
 
 def latest_scan_ids(conn: sqlite3.Connection, segment_id: str, older: str | None, newer: str | None) -> tuple[str, str]:

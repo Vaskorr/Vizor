@@ -22,23 +22,25 @@ test("server-renders the Vizor operations console", async () => {
   const html = await response.text();
   assert.match(html, /<title>Vizor — мониторинг сети<\/title>/i);
   assert.match(html, /VIZOR/);
-  assert.match(html, /Обзор сети/);
-  assert.match(html, /Запустить скан/);
+  assert.match(html, /Проверяем сессию/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
 test("ships the requested Nmap workflows", async () => {
-  const [page, layout, packageJson, dockerfile, backend] = await Promise.all([
+  const [page, layout, packageJson, dockerfile, backend, compose] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../Dockerfile", import.meta.url), "utf8"),
     readFile(new URL("../server/main.py", import.meta.url), "utf8"),
+    readFile(new URL("../docker-compose.yml", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /DOMParser/);
   assert.match(page, /\/api\/scans\/run/);
   assert.match(page, /\/api\/reports\/changes\.pdf/);
+  assert.match(page, /\/api\/auth\/login/);
+  assert.match(page, /credentials:\s*"include"/);
   assert.match(page, /NSE-скрипт/);
   assert.match(layout, /Vizor — мониторинг сети/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
@@ -46,6 +48,10 @@ test("ships the requested Nmap workflows", async () => {
   assert.match(backend, /subprocess\.run\(\s*command/);
   assert.match(backend, /NMAP_SWITCH_OPTIONS/);
   assert.match(backend, /NMAP_SERVICE_MANAGED_OPTIONS/);
+  assert.match(backend, /require_authentication/);
+  assert.match(backend, /httponly=True/);
+  assert.match(compose, /VIZOR_USERNAME:\s*vizor/);
+  assert.match(compose, /VIZOR_PASSWORD:\s*vizor\s*# CHANGE THIS!/);
   assert.match(backend, /shell=False/);
   assert.match(backend, /CREATE TABLE IF NOT EXISTS scripts/);
   assert.doesNotMatch(backend, /shell\s*=\s*True/);
