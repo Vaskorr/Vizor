@@ -1,8 +1,11 @@
 import importlib
+import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SAMPLE_XML = """<?xml version="1.0"?>
@@ -50,10 +53,20 @@ class VizorBackendTest(unittest.TestCase):
             "-sV; touch /tmp/pwned",
             "-sV $(id)",
             "-sV `id`",
+            "-sV && id",
+            "-sV 192.168.0.0/16",
+            "-sV -- 192.168.0.0/16",
             "--datadir /tmp",
+            "--datadir=/tmp",
             "-oX /tmp/stolen.xml",
+            "-oX/tmp/stolen.xml",
             "--script /tmp/evil.nse",
+            "--script=../evil",
+            "--script-args-file /etc/passwd",
             "-iL /etc/passwd",
+            "-iR100",
+            "--excludefile=/etc/passwd",
+            "--resume /tmp/scan.nmap",
         ]
         for flags in malicious_flags:
             with self.subTest(flags=flags), self.assertRaises(ValueError):
@@ -64,9 +77,106 @@ class VizorBackendTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.main.build_nmap_command("127.0.0.1", Path(self.temp_dir.name) / "scan.xml", {**base, "scripts": "../../evil.nse"})
 
-    def test_accepts_allowlisted_flags_only(self):
+    def test_accepts_full_scan_option_grammar(self):
         flags = self.main.parse_safe_nmap_flags("-sS -sV -Pn -p 22,80,443 --top-ports 100 --host-timeout 5m")
         self.assertEqual(flags, ["-sS", "-sV", "-Pn", "-p", "22,80,443", "--top-ports", "100", "--host-timeout", "5m"])
+
+        comprehensive = self.main.parse_safe_nmap_flags(
+            "-sn -PS80,443 -PA -PU53 -PY80 -PO1,6 --dns-servers 10.0.0.53 "
+            "--system-dns --traceroute -sT -sU --scanflags SYN,ACK "
+            "-pT:22,80,U:53 --exclude-ports 25 --top-ports=100 --port-ratio 0.1 "
+            "-sV --version-intensity 7 --version-trace -sC "
+            "--script 'default and not intrusive' "
+            "--script-args 'http.useragent=Vizor Test,token=$(id);literal=true' "
+            "--script-timeout 30s -O --osscan-guess --max-os-tries 3 -T4 "
+            "--min-hostgroup 16 --max-parallelism 50 --min-rtt-timeout 100ms "
+            "--max-rtt-timeout 2s --max-retries 10 --host-timeout 5m "
+            "--scan-delay 10ms --max-scan-delay 1s --min-rate 10.5 --max-rate 1000 "
+            "--stats-every 15s -ff --mtu 24 -D RND:5,ME -S 10.0.0.1 -e eth0 "
+            "-g53 --proxies http://proxy.internal:8080 --data deadbeef "
+            "--data-string 'hello;$(id)' --data-length 16 --ip-options R --ttl 64 "
+            "--spoof-mac 0 -vv -d2 --reason --open --packet-trace --noninteractive "
+            "--stylesheet https://nmap.org/svn/docs/nmap.xsl --webxml -6 -A --send-ip --privileged"
+        )
+        self.assertIn("--script-args", comprehensive)
+        self.assertIn("http.useragent=Vizor Test,token=$(id);literal=true", comprehensive)
+        self.assertIn("hello;$(id)", comprehensive)
+        self.assertIn("-g", comprehensive)
+        self.assertIn("53", comprehensive)
+
+    def test_accepts_inline_values_and_safe_exclusions(self):
+        flags = self.main.parse_safe_nmap_flags(
+            "-p443 -sIzombie.internal:80 -Ddecoy.internal,ME -S10.0.0.10 -eeth0 "
+            "--source-port=53 --exclude=10.0.0.1,10.0.2.0/24 --script=http-*"
+        )
+        self.assertEqual(flags[0:2], ["-p", "443"])
+        self.assertIn("--exclude", flags)
+        self.assertIn("10.0.0.1,10.0.2.0/24", flags)
+        self.assertEqual(flags[-2:], ["--script", "http-*"])
+
+    def test_rejects_unknown_missing_and_invalid_option_values(self):
+        invalid = [
+            "--definitely-not-an-nmap-option",
+            "-p",
+            "-p 80;id",
+            "--version-intensity 10",
+            "--port-ratio 1.1",
+            "--mtu 23",
+            "--data xyz",
+            "--exclude example.org",
+            "--script ../../evil.nse",
+            "--host-timeout forever",
+            "-T9",
+        ]
+        for flags in invalid:
+            with self.subTest(flags=flags), self.assertRaises(ValueError):
+                self.main.parse_safe_nmap_flags(flags)
+
+    def test_settings_validation_uses_the_same_backend_parser(self):
+        payload = self.main.SettingsPayload(
+            flags="-sV -pT:22,443,U:53 --script 'default or safe' --script-args 'k=$(id);x=1'",
+            scripts="default and safe",
+        )
+        values = self.main.validate_settings_payload(payload)
+        self.assertEqual(values["flags"], payload.flags)
+
+        with self.assertRaises(self.main.HTTPException) as context:
+            self.main.validate_settings_payload(self.main.SettingsPayload(flags="-sV; id"))
+        self.assertEqual(context.exception.status_code, 422)
+
+    def test_scan_process_receives_argv_without_a_shell(self):
+        literal_payload = "$(touch /tmp/vizor-rce-marker);`id`"
+        with self.main.db() as connection:
+            connection.execute(
+                "INSERT INTO segments(id, name, targets, enabled) VALUES ('local', 'Local', '127.0.0.1', 1)"
+            )
+            connection.execute(
+                "INSERT INTO scans(id, segment_id, started_at, status) VALUES ('scan-safe', 'local', ?, 'running')",
+                (self.main.now_iso(),),
+            )
+            connection.execute(
+                "INSERT INTO settings(key, value) VALUES ('flags', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(f"-sn --data-string '{literal_payload}'"),),
+            )
+            connection.execute(
+                "INSERT INTO settings(key, value) VALUES ('scripts', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(""),),
+            )
+
+        def fake_run(command, **kwargs):
+            self.assertIsInstance(command, list)
+            self.assertIs(kwargs["shell"], False)
+            self.assertIn(literal_payload, command)
+            output_path = Path(command[command.index("-oX") + 1])
+            output_path.write_text(SAMPLE_XML, encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch.object(self.main.subprocess, "run", side_effect=fake_run):
+            self.main.execute_scan("scan-safe", "local")
+
+        with self.main.db() as connection:
+            status = connection.execute("SELECT status FROM scans WHERE id='scan-safe'").fetchone()["status"]
+        self.assertEqual(status, "success")
 
     def test_parse_xml_and_searchable_schema(self):
         xml_path = Path(self.temp_dir.name) / "sample.xml"

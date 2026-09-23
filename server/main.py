@@ -33,27 +33,105 @@ DATA_DIR = Path(os.getenv("VIZOR_DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "vizor.db"
 SCANS_DIR = DATA_DIR / "scans"
 MAX_XML_BYTES = 100 * 1024 * 1024
-MAX_FLAGS_LENGTH = 1000
-SAFE_NMAP_SWITCHES = {
-    "-sS", "-sT", "-sU", "-sV", "-O", "-Pn", "-n", "-R", "-F",
-    "--open", "--reason", "--version-light", "--version-all", "--traceroute",
-    "--packet-trace", "--disable-arp-ping", "--send-ip", "--send-eth",
+MAX_FLAGS_LENGTH = 8192
+MAX_NMAP_TOKENS = 256
+MAX_NMAP_VALUE_LENGTH = 4096
+
+# These are scan options from Nmap 7.x. Options that let a request replace the
+# scan targets, read local files, write arbitrary files, or load NSE code from
+# a path are intentionally handled separately below.
+NMAP_SWITCH_OPTIONS = frozenset({
+    # Target and host discovery.
+    "-sL", "-sn", "-Pn", "-n", "-R", "-PE", "-PP", "-PM", "-PR",
+    "--system-dns", "--traceroute", "--resolve-all", "--unique",
+    "--disable-arp-ping", "--discovery-ignore-rst", "--randomize-hosts",
+    "--randomize_hosts",
+    # Scan techniques and port selection.
+    "-sS", "-sT", "-sA", "-sW", "-sM", "-sU", "-sN", "-sF", "-sX",
+    "-sY", "-sZ", "-sO", "-F", "-r",
+    # Service, NSE, and OS detection.
+    "-sV", "--version-light", "--version-all", "--version-trace", "--allports",
+    "-sC", "--script-trace", "-O", "--osscan-limit", "--osscan-guess", "--fuzzy",
+    # Firewall/IDS evasion and packet behavior.
+    "-f", "--badsum", "--adler32",
+    # Output detail (the output destination itself is service-managed).
+    "-v", "-d", "--verbose", "--debug", "--reason", "--open", "--packet-trace",
+    "--noninteractive", "--webxml", "--no-stylesheet", "--log-errors",
+    "--deprecated-xml-osclass",
+    # Miscellaneous.
+    "-6", "-A", "--send-eth", "--send-ip", "--privileged", "--unprivileged",
+    "--defeat-rst-ratelimit", "--defeat-icmp-ratelimit", "--release-memory",
+    # Backward-compatible aliases still accepted by Nmap.
+    "-sP", "-P0", "-PN", "-PI", "-PB",
+})
+
+# Value kinds are validated below. Keeping the option grammar explicit means
+# unknown options and accidental positional targets fail closed.
+NMAP_VALUE_OPTIONS = {
+    "--exclude": "targets",
+    "--dns-servers": "literal",
+    "-sI": "literal",
+    "-b": "literal",
+    "--scanflags": "scanflags",
+    "-p": "ports",
+    "--exclude-ports": "ports",
+    "--top-ports": "positive_integer",
+    "--port-ratio": "ratio",
+    "--version-intensity": "version_intensity",
+    "--script": "script_selector",
+    "--script-args": "literal",
+    "--script-timeout": "duration",
+    "--max-os-tries": "positive_integer",
+    "--min-hostgroup": "positive_integer",
+    "--max-hostgroup": "positive_integer",
+    "--min-parallelism": "positive_integer",
+    "--max-parallelism": "positive_integer",
+    "--min-rtt-timeout": "duration",
+    "--max-rtt-timeout": "duration",
+    "--initial-rtt-timeout": "duration",
+    "--max-retries": "nonnegative_integer",
+    "--host-timeout": "duration",
+    "--scan-delay": "duration",
+    "--max-scan-delay": "duration",
+    "--min-rate": "positive_number",
+    "--max-rate": "positive_number",
+    "--stats-every": "duration",
+    "--mtu": "mtu",
+    "-D": "literal",
+    "-S": "literal",
+    "-e": "literal",
+    "-g": "port_number",
+    "--source-port": "port_number",
+    "--proxies": "literal",
+    "--data": "hex",
+    "--data-string": "literal",
+    "--data-length": "data_length",
+    "--ip-options": "literal",
+    "--ttl": "ttl",
+    "--spoof-mac": "literal",
+    "--stylesheet": "literal",
+    "--nsock-engine": "literal",
 }
-SAFE_INTEGER_FLAGS = {
-    "--top-ports": (1, 65535),
-    "--max-retries": (0, 20),
-    "--min-rate": (1, 1_000_000),
-    "--max-rate": (1, 1_000_000),
-    "--min-hostgroup": (1, 65535),
-    "--max-hostgroup": (1, 65535),
-    "--min-parallelism": (1, 65535),
-    "--max-parallelism": (1, 65535),
-    "--version-intensity": (0, 9),
-}
-SAFE_DURATION_FLAGS = {"--host-timeout", "--scan-delay", "--max-scan-delay", "--script-timeout"}
-PORT_SPEC_PATTERN = re.compile(r"^(?:[TU]:)?[0-9,-]+(?:,(?:[TU]:)?[0-9,-]+)*$")
-DURATION_PATTERN = re.compile(r"^[1-9][0-9]*(?:ms|s|m|h)?$")
-SCRIPT_SELECTOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)*$")
+
+# Nmap accepts these options, but Vizor must own them to keep a scan inside the
+# configured target set and its private data directory. In particular, an NSE
+# filename/directory would load executable Lua code.
+NMAP_SERVICE_MANAGED_OPTIONS = frozenset({
+    "-iL", "-iR", "--excludefile",
+    "-oN", "-oX", "-oS", "-oG", "-oA", "--append-output", "--resume",
+    "--datadir", "--servicedb", "--versiondb",
+    "--script-args-file", "--script-help", "--script-updatedb",
+    "--iflist", "-V", "--version", "-h", "--help",
+})
+
+SHORT_VALUE_PREFIXES = ("-sI", "-p", "-D", "-S", "-e", "-g", "-b")
+PROBE_OPTIONS = {"-PS": "ports", "-PA": "ports", "-PU": "ports", "-PY": "ports", "-PO": "protocols", "-PT": "ports"}
+PORT_SPEC_PATTERN = re.compile(r"^[A-Za-z0-9_*?.,:\-\[\]]+$")
+PROTOCOL_SPEC_PATTERN = re.compile(r"^[0-9,-]+$")
+DURATION_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:ms|s|m|h)?$")
+POSITIVE_NUMBER_PATTERN = re.compile(r"^(?:[1-9][0-9]*(?:\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)$")
+SCANFLAGS_PATTERN = re.compile(r"^(?:0x[0-9A-Fa-f]+|[0-9]+|[A-Za-z]+(?:,[A-Za-z]+)*)$")
+SCRIPT_SELECTOR_PATTERN = re.compile(r"^[A-Za-z0-9_+*?(), \-]+$")
 DEFAULT_SETTINGS = {
     "speed": "T3",
     "exclusions": "",
@@ -218,65 +296,164 @@ def normalize_targets(raw: str) -> list[str]:
     return targets
 
 
+def _is_service_managed_option(token: str) -> bool:
+    for option in NMAP_SERVICE_MANAGED_OPTIONS:
+        if token == option or (option.startswith("--") and token.startswith(f"{option}=")):
+            return True
+        if option.startswith("-") and not option.startswith("--") and token.startswith(option) and len(token) > len(option):
+            return True
+    return False
+
+
+def _validate_integer(option: str, value: str, minimum: int, maximum: int = 2_147_483_647) -> None:
+    if not value.isascii() or not value.isdigit():
+        raise ValueError(f"Для {option} требуется целое число")
+    number = int(value)
+    if not minimum <= number <= maximum:
+        raise ValueError(f"Значение {option} должно быть от {minimum} до {maximum}")
+
+
+def _validate_nmap_value(option: str, value: str, kind: str) -> None:
+    if not value or len(value) > MAX_NMAP_VALUE_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"Некорректное значение для {option}")
+    if kind == "literal":
+        return
+    if kind == "targets":
+        normalize_targets(value)
+    elif kind == "ports":
+        if not PORT_SPEC_PATTERN.fullmatch(value) or not any(char.isalnum() for char in value):
+            raise ValueError(f"Некорректная спецификация портов для {option}")
+    elif kind == "protocols":
+        if not PROTOCOL_SPEC_PATTERN.fullmatch(value) or not any(char.isdigit() for char in value):
+            raise ValueError(f"Некорректный список IP-протоколов для {option}")
+    elif kind == "scanflags":
+        if not SCANFLAGS_PATTERN.fullmatch(value):
+            raise ValueError("Некорректное значение TCP-флагов")
+    elif kind == "duration":
+        if not DURATION_PATTERN.fullmatch(value):
+            raise ValueError(f"Некорректное значение времени для {option}")
+    elif kind == "positive_number":
+        if not POSITIVE_NUMBER_PATTERN.fullmatch(value):
+            raise ValueError(f"Для {option} требуется положительное число")
+    elif kind == "positive_integer":
+        _validate_integer(option, value, 1)
+    elif kind == "nonnegative_integer":
+        _validate_integer(option, value, 0)
+    elif kind == "version_intensity":
+        _validate_integer(option, value, 0, 9)
+    elif kind == "port_number":
+        _validate_integer(option, value, 0, 65535)
+    elif kind == "data_length":
+        _validate_integer(option, value, 0, 65535)
+    elif kind == "ttl":
+        _validate_integer(option, value, 0, 255)
+    elif kind == "mtu":
+        _validate_integer(option, value, 8, 65528)
+        if int(value) % 8:
+            raise ValueError("Значение --mtu должно быть кратно 8")
+    elif kind == "ratio":
+        try:
+            ratio = float(value)
+        except ValueError as exc:
+            raise ValueError("Для --port-ratio требуется число от 0 до 1") from exc
+        if not 0 < ratio <= 1 or not re.fullmatch(r"(?:0(?:\.[0-9]+)?|1(?:\.0+)?)", value):
+            raise ValueError("Для --port-ratio требуется число больше 0 и не больше 1")
+    elif kind == "hex":
+        if len(value) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", value):
+            raise ValueError("Для --data требуется чётное количество шестнадцатеричных цифр")
+    elif kind == "script_selector":
+        validate_script_selector(value, allow_empty=False)
+    else:  # pragma: no cover - a programming error in the option table
+        raise RuntimeError(f"Неизвестный валидатор Nmap: {kind}")
+
+
 def parse_safe_nmap_flags(raw: str) -> list[str]:
     if len(raw) > MAX_FLAGS_LENGTH:
         raise ValueError("Строка флагов Nmap слишком длинная")
-    if any(ord(char) < 32 for char in raw) or any(char in raw for char in ";&|`$<>\\{}"):
-        raise ValueError("Строка флагов содержит запрещённые символы")
+    if any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise ValueError("Строка флагов содержит управляющие символы")
     try:
         tokens = shlex.split(raw, posix=True)
     except ValueError as exc:
         raise ValueError("Не удалось разобрать строку флагов Nmap") from exc
+    if len(tokens) > MAX_NMAP_TOKENS:
+        raise ValueError("Слишком много флагов Nmap")
 
     safe: list[str] = []
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token in SAFE_NMAP_SWITCHES:
+        if token == "--":
+            raise ValueError("Разделитель -- запрещён: цели задаются только сегментом Vizor")
+        if _is_service_managed_option(token):
+            raise ValueError(f"Опция {token.split('=', 1)[0]} управляется сервисом Vizor и недоступна в поле флагов")
+        if token in NMAP_SWITCH_OPTIONS or re.fullmatch(r"-(?:v+|d+|v[0-9]+|d[0-9]+|ff)", token):
+            safe.append(token)
+            index += 1
+            continue
+
+        probe_match = re.fullmatch(r"-(PS|PA|PU|PY|PO|PT)(.*)", token)
+        if probe_match:
+            flag = f"-{probe_match.group(1)}"
+            value = probe_match.group(2)
+            safe.append(flag if not value else token)
+            if value:
+                _validate_nmap_value(flag, value, PROBE_OPTIONS[flag])
+            index += 1
+            continue
+
+        if re.fullmatch(r"-T[0-5]", token):
             safe.append(token)
             index += 1
             continue
 
         flag = token
         inline_value: str | None = None
-        if "=" in token:
+        if token.startswith("--") and "=" in token:
             flag, inline_value = token.split("=", 1)
-        elif token.startswith("-p") and token != "-p":
-            flag, inline_value = "-p", token[2:]
+        elif token in NMAP_VALUE_OPTIONS:
+            flag = token
+        else:
+            for prefix in SHORT_VALUE_PREFIXES:
+                if token.startswith(prefix) and len(token) > len(prefix):
+                    flag, inline_value = prefix, token[len(prefix):]
+                    break
 
-        if flag == "-p" or flag in SAFE_INTEGER_FLAGS or flag in SAFE_DURATION_FLAGS:
-            if inline_value is None:
-                index += 1
-                if index >= len(tokens):
-                    raise ValueError(f"Для {flag} требуется значение")
-                inline_value = tokens[index]
-
-            if flag == "-p":
-                if not PORT_SPEC_PATTERN.fullmatch(inline_value):
-                    raise ValueError("Некорректная спецификация портов")
-            elif flag in SAFE_INTEGER_FLAGS:
-                if not inline_value.isdigit():
-                    raise ValueError(f"Для {flag} требуется целое число")
-                minimum, maximum = SAFE_INTEGER_FLAGS[flag]
-                if not minimum <= int(inline_value) <= maximum:
-                    raise ValueError(f"Значение {flag} должно быть от {minimum} до {maximum}")
-            elif not DURATION_PATTERN.fullmatch(inline_value):
-                raise ValueError(f"Некорректное значение времени для {flag}")
-
-            safe.extend([flag, inline_value])
+        kind = NMAP_VALUE_OPTIONS.get(flag)
+        if kind is None:
+            if not token.startswith("-"):
+                raise ValueError(f"Позиционный аргумент запрещён: {token}. Цели задаются сегментом Vizor")
+            raise ValueError(f"Неизвестная или недоступная опция Nmap: {token}")
+        if inline_value is None:
             index += 1
-            continue
+            if index >= len(tokens):
+                raise ValueError(f"Для {flag} требуется значение")
+            inline_value = tokens[index]
 
-        raise ValueError(f"Флаг Nmap не разрешён: {token}")
+        _validate_nmap_value(flag, inline_value, kind)
+        safe.extend([flag, inline_value])
+        index += 1
     return safe
 
 
-def validate_script_selector(raw: str) -> str:
+def validate_script_selector(raw: str, *, allow_empty: bool = True) -> str:
     value = raw.strip()
-    if not value:
+    if not value and allow_empty:
         return ""
-    if len(value) > 500 or not SCRIPT_SELECTOR_PATTERN.fullmatch(value):
-        raise ValueError("NSE допускает только категории и имена скриптов через запятую")
+    # Only installed script/category selectors and boolean expressions are
+    # accepted. Slash, backslash, colon, and .nse would turn this into a path.
+    lowered = value.lower()
+    if (
+        not value
+        or len(value) > 1000
+        or not SCRIPT_SELECTOR_PATTERN.fullmatch(value)
+        or "/" in value
+        or "\\" in value
+        or ":" in value
+        or ".nse" in lowered
+        or ".." in value
+    ):
+        raise ValueError("NSE допускает только имена/категории установленных скриптов и логические выражения")
     return value
 
 

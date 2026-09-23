@@ -41,6 +41,6 @@ docker compose up --build -d
 
 ## Security
 
-Vizor never invokes Nmap through a shell. Additional Nmap arguments are parsed into an argument array and restricted to an explicit allowlist; output, input-file, data-directory and script-path flags are rejected. Scan targets and exclusions must be IP addresses or CIDR networks, and NSE selectors accept only installed script or category names.
+Vizor never invokes Nmap through a shell. Additional Nmap arguments are parsed into an argument array and validated against the Nmap 7.x scan-option grammar, including options with separate, attached, or `--option=value` parameters. Unknown options and positional arguments are rejected. Vizor exclusively manages scan targets and output files; input-file, data-directory, resume, arbitrary output, and NSE script-path options are blocked. Scan targets and exclusions must be IP addresses or CIDR networks, and NSE selectors accept only installed script/category names or selector expressions.
 
 Use Vizor only on networks for which you have explicit authorization.

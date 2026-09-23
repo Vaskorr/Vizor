@@ -44,7 +44,8 @@ test("ships the requested Nmap workflows", async () => {
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   assert.match(dockerfile, /apt-get install[^\n]*nmap/);
   assert.match(backend, /subprocess\.run\(\s*command/);
-  assert.match(backend, /SAFE_NMAP_SWITCHES/);
+  assert.match(backend, /NMAP_SWITCH_OPTIONS/);
+  assert.match(backend, /NMAP_SERVICE_MANAGED_OPTIONS/);
   assert.match(backend, /shell=False/);
   assert.match(backend, /CREATE TABLE IF NOT EXISTS scripts/);
   assert.doesNotMatch(backend, /shell\s*=\s*True/);
